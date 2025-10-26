@@ -504,7 +504,7 @@ BEGIN
   END IF;
 END$$
 
-# BUDGET_LOG: Basic guard (No negative Amount)
+# T4 - BUDGET_LOG: Basic guard (No negative Amount)
 DROP TRIGGER IF EXISTS trg_budgetlog_bi$$
 CREATE TRIGGER trg_budgetlog_bi
 BEFORE INSERT ON BUDGET_LOG
