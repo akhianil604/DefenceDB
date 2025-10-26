@@ -1,0 +1,528 @@
+USE defense_db;
+DELIMITER $$
+			# FUNCTIONS
+# F1. Compute total cost for a product & quantity
+CREATE FUNCTION calc_total_cost(p_item_id VARCHAR(7), p_qty INT)
+	RETURNS DECIMAL(20,2)
+	DETERMINISTIC
+	BEGIN
+		DECLARE v_unit DECIMAL(20,2);
+		IF p_qty IS NULL OR p_qty <= 0 THEN
+			SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Quantity must be positive.';
+		END IF;
+        
+		SELECT Unit_Cost INTO v_unit
+		FROM PRODUCT
+		WHERE Item_ID = p_item_id;
+
+		IF v_unit IS NULL THEN
+			SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Unknown Item_ID.';
+		END IF;
+	RETURN v_unit * p_qty;
+END$$
+
+# F2. Remaining budget for a department
+CREATE FUNCTION dept_budget_left(p_dept_id VARCHAR(6))
+	RETURNS DECIMAL(20,2)
+	DETERMINISTIC
+	BEGIN
+		DECLARE v_left DECIMAL(20,2);
+		SELECT Current_Budget INTO v_left
+		FROM DEPARTMENT
+		WHERE Dept_ID = p_dept_id;
+
+		IF v_left IS NULL THEN
+		SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Unknown Dept_ID.';
+		END IF;
+	RETURN v_left;
+END$$
+
+# F3. Can fulfill stock?
+CREATE FUNCTION can_fulfill_stock(p_item_id VARCHAR(7), p_qty INT)
+RETURNS INTEGER
+DETERMINISTIC
+BEGIN
+  DECLARE v_stock INT;
+  IF p_qty IS NULL OR p_qty <= 0 THEN
+    RETURN 0;
+  END IF;
+
+  SELECT Stock_Available INTO v_stock
+  FROM PRODUCT WHERE Item_ID = p_item_id;
+
+  IF v_stock IS NULL THEN
+    RETURN 0;
+  END IF;
+
+  RETURN (v_stock >= p_qty);
+END$$
+
+# F4. Normalize product category to whitelist
+CREATE FUNCTION normalize_category(p_cat VARCHAR(50))
+RETURNS VARCHAR(50)
+DETERMINISTIC
+BEGIN
+  IF p_cat IN (
+    'Tanks','Armored Trucks','Fighter Jets','Submarines','Drones','Transport Aircraft',
+    'Rifles','Missiles','Artillery System','Air-defence systems',
+    'Radios','Satellite Phones','Secure Routers','Command Servers','Radar installations',
+    'Firewalls','Threat monitoring platforms','Data centers',
+    'Helmets','Defence suits','Uniform',
+    'First-aid kits','Medical drones','Surgical instruments',
+    'Others'
+  ) THEN
+    RETURN p_cat;
+  END IF;
+
+  IF p_cat = 'Threat Intelligence Platform' THEN RETURN 'Threat monitoring platforms'; END IF;
+  IF p_cat = 'Boots' THEN RETURN 'Uniform'; END IF;
+  IF p_cat IN ('Field Hospitals','Miscellaneous') THEN RETURN 'Others'; END IF;
+
+  RETURN 'Others';
+END$$
+
+# F5. Compute request total from its current fields
+CREATE FUNCTION request_total_cost(p_request_id VARCHAR(10))
+RETURNS DECIMAL(20,2)
+DETERMINISTIC
+BEGIN
+  DECLARE v_item VARCHAR(7);
+  DECLARE v_qty INT;
+  DECLARE v_sum DECIMAL(20,2);
+
+  SELECT Item_ID, Quantity INTO v_item, v_qty
+  FROM PROCUREMENT_REQUEST WHERE Request_ID = p_request_id;
+
+  IF v_item IS NULL THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Unknown Request_ID.';
+  END IF;
+
+  SET v_sum = calc_total_cost(v_item, v_qty);
+  RETURN v_sum;
+END$$
+
+						# PROCEDURES
+# P1. Create a new request (validations + compute total)
+CREATE PROCEDURE create_procurement_request(
+  IN p_request_id VARCHAR(10),
+  IN p_dept_id    VARCHAR(6),
+  IN p_item_id    VARCHAR(7),
+  IN p_vendor_id  VARCHAR(6),
+  IN p_qty        INT
+)
+BEGIN
+  DECLARE v_cost DECIMAL(20,2);
+  DECLARE v_vendor_of_item VARCHAR(6);
+  DECLARE v_blacklisted BOOLEAN;
+
+  IF EXISTS(SELECT 1 FROM PROCUREMENT_REQUEST WHERE Request_ID = p_request_id) THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Request_ID already exists.';
+  END IF;
+
+  IF p_qty IS NULL OR p_qty <= 0 THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Quantity must be positive.';
+  END IF;
+
+  # Validate foreign keys
+  IF NOT EXISTS(SELECT 1 FROM DEPARTMENT WHERE Dept_ID = p_dept_id) THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Unknown Dept_ID.';
+  END IF;
+
+  IF NOT EXISTS(SELECT 1 FROM PRODUCT WHERE Item_ID = p_item_id) THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Unknown Item_ID.';
+  END IF;
+
+  IF NOT EXISTS(SELECT 1 FROM VENDOR WHERE Vendor_ID = p_vendor_id) THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Unknown Vendor_ID.';
+  END IF;
+
+  SELECT Vendor_ID INTO v_vendor_of_item
+  FROM PRODUCT WHERE Item_ID = p_item_id;
+
+  IF v_vendor_of_item IS NULL OR v_vendor_of_item <> p_vendor_id THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Vendor does not supply the selected product.';
+  END IF;
+
+  # Check vendor status
+  SELECT Blacklisted INTO v_blacklisted FROM VENDOR WHERE Vendor_ID = p_vendor_id;
+  IF v_blacklisted THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Vendor is blacklisted.';
+  END IF;
+
+  # Compute total
+  SET v_cost = calc_total_cost(p_item_id, p_qty);
+
+  INSERT INTO PROCUREMENT_REQUEST
+    (Request_ID, Dept_ID, Item_ID, Vendor_ID, Quantity, Total_Cost, Status, Request_Date)
+  VALUES
+    (p_request_id, p_dept_id, p_item_id, p_vendor_id, p_qty, v_cost, 'PENDING', NOW());
+END$$
+
+# P2. Approve a request (atomic workflow)
+# STEPS:
+# 1. Validates status
+# 2. Checks dept budget & stock
+# 3. Deducts stock, deducts dept budget
+# 4. Writes to BUDGET_LOG
+# 5. Stamps Approved_Date & Admin_ID
+CREATE PROCEDURE approve_request(
+  IN p_request_id VARCHAR(10),
+  IN p_admin_id   VARCHAR(6)
+)
+BEGIN
+  DECLARE v_status VARCHAR(20);
+  DECLARE v_dept   VARCHAR(6);
+  DECLARE v_item   VARCHAR(7);
+  DECLARE v_vendor VARCHAR(6);
+  DECLARE v_qty    INT;
+  DECLARE v_total  DECIMAL(20,2);
+  DECLARE v_budget DECIMAL(20,2);
+  DECLARE v_stock  INT;
+
+  # Lock rows we’ll touch to keep it consistent
+  START TRANSACTION;
+
+  # Validate admin
+  IF NOT EXISTS(SELECT 1 FROM MINISTRY WHERE Admin_ID = p_admin_id) THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Unknown Admin_ID.';
+  END IF;
+
+  # Load request (FOR UPDATE to serialize)
+  SELECT Status, Dept_ID, Item_ID, Vendor_ID, Quantity, Total_Cost
+    INTO v_status, v_dept, v_item, v_vendor, v_qty, v_total
+  FROM PROCUREMENT_REQUEST
+  WHERE Request_ID = p_request_id
+  FOR UPDATE;
+
+  IF v_status IS NULL THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Unknown Request_ID.';
+  END IF;
+
+  IF v_status <> 'PENDING' THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Only PENDING requests can be approved.';
+  END IF;
+
+  # Budget check
+  SELECT Current_Budget INTO v_budget
+  FROM DEPARTMENT
+  WHERE Dept_ID = v_dept
+  FOR UPDATE;
+
+  IF v_budget IS NULL OR v_budget < v_total THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Insufficient department budget.';
+  END IF;
+
+  # Stock check
+  SELECT Stock_Available INTO v_stock
+  FROM PRODUCT
+  WHERE Item_ID = v_item
+  FOR UPDATE;
+
+  IF v_stock IS NULL OR v_stock < v_qty THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Insufficient stock.';
+  END IF;
+
+  # Deduct stock
+  UPDATE PRODUCT
+  SET Stock_Available = Stock_Available - v_qty
+  WHERE Item_ID = v_item;
+
+  # Deduct budget
+  UPDATE DEPARTMENT
+  SET Current_Budget = Current_Budget - v_total
+  WHERE Dept_ID = v_dept;
+
+  # Log budget movement
+  INSERT INTO BUDGET_LOG (Log_ID, Dept_ID, Request_ID, Admin_ID, Amount, Action, Log_Timestamp)
+  VALUES (CONCAT('BL', LPAD(FLOOR(RAND()*999999),6,'0')), v_dept, p_request_id, p_admin_id, v_total, 'DEDUCT', NOW());
+
+  # Finalize request
+  UPDATE PROCUREMENT_REQUEST
+  SET Status = 'APPROVED',
+      Approved_Date = NOW(),
+      Admin_ID = p_admin_id,
+      Total_Cost = v_total -- keep it explicit
+  WHERE Request_ID = p_request_id;
+
+  COMMIT;
+END$$
+
+# P3. Reject a request (Through the log, giving reasons)
+CREATE PROCEDURE reject_request(
+  IN p_request_id VARCHAR(10),
+  IN p_admin_id   VARCHAR(6),
+  IN p_reason     VARCHAR(255)
+)
+BEGIN
+  DECLARE v_status VARCHAR(20);
+  DECLARE v_dept   VARCHAR(6);
+
+  START TRANSACTION;
+
+  IF NOT EXISTS(SELECT 1 FROM MINISTRY WHERE Admin_ID = p_admin_id) THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Unknown Admin_ID.';
+  END IF;
+
+  SELECT Status, Dept_ID INTO v_status, v_dept
+  FROM PROCUREMENT_REQUEST
+  WHERE Request_ID = p_request_id
+  FOR UPDATE;
+
+  IF v_status IS NULL THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Unknown Request_ID.';
+  END IF;
+
+  IF v_status <> 'PENDING' THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Only PENDING requests can be rejected.';
+  END IF;
+
+  UPDATE PROCUREMENT_REQUEST
+  SET Status = 'REJECTED',
+      Approved_Date = NULL,
+      Admin_ID = p_admin_id
+  WHERE Request_ID = p_request_id;
+
+  # Log as REFUND with 0 (acts like an audit note)
+  INSERT INTO BUDGET_LOG (Log_ID, Dept_ID, Request_ID, Admin_ID, Amount, Action, Log_Timestamp)
+  VALUES (CONCAT('BL', LPAD(FLOOR(RAND()*999999),6,'0')), v_dept, p_request_id, p_admin_id, 0, CONCAT('REJECT:', COALESCE(p_reason,'')), NOW());
+
+  COMMIT;
+END$$
+
+# P4. Cancel an approved request (Restock & Refund)
+CREATE PROCEDURE cancel_request(
+  IN p_request_id VARCHAR(10),
+  IN p_admin_id   VARCHAR(6),
+  IN p_reason     VARCHAR(255)
+)
+BEGIN
+  DECLARE v_status VARCHAR(20);
+  DECLARE v_dept   VARCHAR(6);
+  DECLARE v_item   VARCHAR(7);
+  DECLARE v_qty    INT;
+  DECLARE v_total  DECIMAL(20,2);
+
+  START TRANSACTION;
+
+  IF NOT EXISTS(SELECT 1 FROM MINISTRY WHERE Admin_ID = p_admin_id) THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Unknown Admin_ID.';
+  END IF;
+
+  SELECT Status, Dept_ID, Item_ID, Quantity, Total_Cost
+    INTO v_status, v_dept, v_item, v_qty, v_total
+  FROM PROCUREMENT_REQUEST
+  WHERE Request_ID = p_request_id
+  FOR UPDATE;
+
+  IF v_status IS NULL THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Unknown Request_ID.';
+  END IF;
+
+  IF v_status <> 'APPROVED' THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Only APPROVED requests can be cancelled.';
+  END IF;
+
+  -- Restock
+  UPDATE PRODUCT
+  SET Stock_Available = Stock_Available + v_qty
+  WHERE Item_ID = v_item;
+
+  # Refund budget
+  UPDATE DEPARTMENT
+  SET Current_Budget = Current_Budget + v_total
+  WHERE Dept_ID = v_dept;
+
+  INSERT INTO BUDGET_LOG (Log_ID, Dept_ID, Request_ID, Admin_ID, Amount, Action, Log_Timestamp)
+  VALUES (CONCAT('BL', LPAD(FLOOR(RAND()*999999),6,'0')), v_dept, p_request_id, p_admin_id, v_total, CONCAT('REFUND:', COALESCE(p_reason,'')), NOW());
+
+  UPDATE PROCUREMENT_REQUEST
+  SET Status = 'CANCELLED',
+      Admin_ID = p_admin_id
+  WHERE Request_ID = p_request_id;
+
+  COMMIT;
+END$$
+
+# P5. Restock product
+CREATE PROCEDURE restock_product(
+  IN p_item_id VARCHAR(7),
+  IN p_add_qty INT
+)
+BEGIN
+  IF NOT EXISTS(SELECT 1 FROM PRODUCT WHERE Item_ID = p_item_id) THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Unknown Item_ID.';
+  END IF;
+
+  IF p_add_qty IS NULL OR p_add_qty <= 0 THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Restock quantity must be positive.';
+  END IF;
+
+  UPDATE PRODUCT
+  SET Stock_Available = Stock_Available + p_add_qty
+  WHERE Item_ID = p_item_id;
+END$$
+
+# P6. Blacklist a vendor and auto-reject pending requests for it
+CREATE PROCEDURE blacklist_vendor(
+  IN p_vendor_id VARCHAR(6),
+  IN p_admin_id  VARCHAR(6),
+  IN p_reason    VARCHAR(255)
+)
+BEGIN
+  START TRANSACTION;
+
+  IF NOT EXISTS(SELECT 1 FROM VENDOR WHERE Vendor_ID = p_vendor_id) THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Unknown Vendor_ID.';
+  END IF;
+
+  UPDATE VENDOR SET Blacklisted = TRUE WHERE Vendor_ID = p_vendor_id;
+
+  UPDATE PROCUREMENT_REQUEST
+  SET Status = 'REJECTED', Admin_ID = p_admin_id
+  WHERE Vendor_ID = p_vendor_id AND Status = 'PENDING';
+
+  # One-liner BUDGET_LOG note
+  INSERT INTO BUDGET_LOG (Log_ID, Dept_ID, Request_ID, Admin_ID, Amount, Action, Log_Timestamp)
+  SELECT CONCAT('BL', LPAD(FLOOR(RAND()*999999),6,'0')),
+         pr.Dept_ID, pr.Request_ID, p_admin_id, 0,
+         CONCAT('VENDOR_BLACKLIST:', COALESCE(p_reason,'')),
+         NOW()
+  FROM PROCUREMENT_REQUEST pr
+  WHERE pr.Vendor_ID = p_vendor_id AND pr.Status = 'REJECTED';
+
+  COMMIT;
+END$$
+
+						# TRIGGERS
+# T1 - PRODUCT: Normalize category & clamp stock >= 0
+DROP TRIGGER IF EXISTS trg_product_bi$$
+CREATE TRIGGER trg_product_bi
+BEFORE INSERT ON PRODUCT
+FOR EACH ROW
+BEGIN
+  SET NEW.Category = normalize_category(NEW.Category);
+  IF NEW.Stock_Available IS NULL OR NEW.Stock_Available < 0 THEN
+    SET NEW.Stock_Available = GREATEST(COALESCE(NEW.Stock_Available,0), 0);
+  END IF;
+END$$
+
+DROP TRIGGER IF EXISTS trg_product_bu$$
+CREATE TRIGGER trg_product_bu
+BEFORE UPDATE ON PRODUCT
+FOR EACH ROW
+BEGIN
+  SET NEW.Category = normalize_category(NEW.Category);
+  IF NEW.Stock_Available < 0 THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Stock cannot be negative.';
+  END IF;
+END$$
+
+# T2 - MINISTRY & VENDOR -  Basic Email Normalization to lowercase
+DROP TRIGGER IF EXISTS trg_ministry_bi$$
+CREATE TRIGGER trg_ministry_bi
+BEFORE INSERT ON MINISTRY
+FOR EACH ROW
+BEGIN
+  IF NEW.Email IS NOT NULL THEN
+    SET NEW.Email = LOWER(NEW.Email);
+  END IF;
+END$$
+
+DROP TRIGGER IF EXISTS trg_ministry_bu$$
+CREATE TRIGGER trg_ministry_bu
+BEFORE UPDATE ON MINISTRY
+FOR EACH ROW
+BEGIN
+  IF NEW.Email IS NOT NULL THEN
+    SET NEW.Email = LOWER(NEW.Email);
+  END IF;
+END$$
+
+DROP TRIGGER IF EXISTS trg_vendor_bi$$
+CREATE TRIGGER trg_vendor_bi
+BEFORE INSERT ON VENDOR
+FOR EACH ROW
+BEGIN
+  IF NEW.Email IS NOT NULL THEN
+    SET NEW.Email = LOWER(NEW.Email);
+  END IF;
+END$$
+
+DROP TRIGGER IF EXISTS trg_vendor_bu$$
+CREATE TRIGGER trg_vendor_bu
+BEFORE UPDATE ON VENDOR
+FOR EACH ROW
+BEGIN
+  IF NEW.Email IS NOT NULL THEN
+    SET NEW.Email = LOWER(NEW.Email);
+  END IF;
+END$$
+
+# T3 - PROCUREMENT_REQUEST: Auto-calculates Total_Cost & Block edits after approval
+DROP TRIGGER IF EXISTS trg_request_bi$$
+CREATE TRIGGER trg_request_bi
+BEFORE INSERT ON PROCUREMENT_REQUEST
+FOR EACH ROW
+BEGIN
+  IF NEW.Quantity IS NULL OR NEW.Quantity <= 0 THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Quantity must be positive.';
+  END IF;
+
+  # Validate Vendor supplies Item
+  IF NOT EXISTS (
+      SELECT 1 FROM PRODUCT p
+      WHERE p.Item_ID = NEW.Item_ID AND p.Vendor_ID = NEW.Vendor_ID
+  ) THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Vendor does not supply the selected product.';
+  END IF;
+
+  # Compute total
+  SET NEW.Total_Cost = calc_total_cost(NEW.Item_ID, NEW.Quantity);
+
+  # Default status if missing
+  IF NEW.Status IS NULL THEN
+    SET NEW.Status = 'PENDING';
+  END IF;
+END$$
+
+DROP TRIGGER IF EXISTS trg_request_bu$$
+CREATE TRIGGER trg_request_bu
+BEFORE UPDATE ON PROCUREMENT_REQUEST
+FOR EACH ROW
+BEGIN
+  # Once approved/rejected/cancelled, lock identifiers & qty
+  IF OLD.Status IN ('APPROVED','REJECTED','CANCELLED') THEN
+    IF (NEW.Dept_ID <> OLD.Dept_ID) OR (NEW.Item_ID <> OLD.Item_ID) OR
+       (NEW.Vendor_ID <> OLD.Vendor_ID) OR (NEW.Quantity <> OLD.Quantity) THEN
+      SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Cannot change identifiers/quantity after finalization.';
+    END IF;
+  END IF;
+
+  # Recompute total cost if qty or item changed (still pending)
+  IF NEW.Status = 'PENDING' AND (NEW.Item_ID <> OLD.Item_ID OR NEW.Quantity <> OLD.Quantity) THEN
+    SET NEW.Total_Cost = calc_total_cost(NEW.Item_ID, NEW.Quantity);
+  END IF;
+END$$
+
+# BUDGET_LOG: Basic guard (No negative Amount)
+DROP TRIGGER IF EXISTS trg_budgetlog_bi$$
+CREATE TRIGGER trg_budgetlog_bi
+BEFORE INSERT ON BUDGET_LOG
+FOR EACH ROW
+BEGIN
+  IF NEW.Amount IS NULL OR NEW.Amount < 0 THEN
+    SET NEW.Amount = 0;
+  END IF;
+  IF NEW.Timestamp IS NULL THEN
+    SET NEW.Timestamp = NOW();
+  END IF;
+END$$
+
+DELIMITER ;
+
+# TEST Queries
+SELECT calc_total_cost('PRO0001', 3);
+CALL create_procurement_request('REQ0007','DPT001','PRO0001','VEN001',5);
+CALL approve_request('REQ0007','ADM001');
+CALL cancel_request('REQ0007','ADM001','Project cancelled');
+CALL blacklist_vendor('VEN002','ADM001','Non-compliance');
