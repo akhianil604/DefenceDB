@@ -101,6 +101,57 @@ BEGIN
   RETURN v_sum;
 END$$
 
+# F6 Department Efficiency %
+CREATE FUNCTION get_department_efficiency(p_dept_id VARCHAR(6))
+RETURNS DECIMAL(5,2)
+DETERMINISTIC
+BEGIN
+    DECLARE v_alloc DECIMAL(20,8);
+    DECLARE v_current DECIMAL(20,8);
+    DECLARE v_eff DECIMAL(5,2);
+
+    SELECT Budget_Allocated, Current_Budget
+    INTO v_alloc, v_current
+    FROM DEPARTMENT
+    WHERE Dept_ID = p_dept_id;
+
+    IF v_alloc IS NULL OR v_alloc = 0 THEN
+        SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT = 'Invalid Department or Allocation.';
+    END IF;
+
+    SET v_eff = (v_current / v_alloc) * 100;
+    RETURN ROUND(v_eff, 2);
+END$$
+
+
+# F7 Average vendor contract duration (in days)
+CREATE FUNCTION avg_vendor_contract_duration()
+RETURNS DECIMAL(10,2)
+DETERMINISTIC
+BEGIN
+    DECLARE v_avg DECIMAL(10,2);
+    SELECT AVG(DATEDIFF(Contract_Expiry_Date, CURDATE()))
+    INTO v_avg
+    FROM VENDOR
+    WHERE Contract_Expiry_Date IS NOT NULL;
+    RETURN IFNULL(v_avg, 0);
+END$$
+
+
+# F8 Pending request count for department
+CREATE FUNCTION get_pending_requests_count(p_dept_id VARCHAR(6))
+RETURNS INT
+DETERMINISTIC
+BEGIN
+    DECLARE v_count INT;
+    SELECT COUNT(*) INTO v_count
+    FROM PROCUREMENT_REQUEST
+    WHERE Dept_ID = p_dept_id AND Status = 'Pending';
+    RETURN v_count;
+END$$
+
+
 						# PROCEDURES
 # P1. Create a new request (validations + compute total)
 CREATE PROCEDURE create_procurement_request(
@@ -393,6 +444,71 @@ BEGIN
   COMMIT;
 END$$
 
+# P7. Log vendor contract renewal
+CREATE PROCEDURE log_contract_renewal(
+    IN p_vendor_id VARCHAR(6),
+    IN p_new_expiry DATE,
+    IN p_admin_id VARCHAR(6)
+)
+BEGIN
+    DECLARE v_old DATE;
+
+    SELECT Contract_Expiry_Date INTO v_old
+    FROM VENDOR WHERE Vendor_ID = p_vendor_id;
+
+    IF v_old IS NULL THEN
+        SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT = 'Invalid Vendor_ID.';
+    END IF;
+
+    UPDATE VENDOR
+    SET Contract_Expiry_Date = p_new_expiry
+    WHERE Vendor_ID = p_vendor_id;
+
+    INSERT INTO BUDGET_LOG (Log_ID, Category, Admin_ID, Amount, Timestamp)
+    VALUES (
+        CONCAT('BL', LPAD(FLOOR(RAND()*999999),6,'0')),
+        CONCAT('Contract Renewed: ', DATE_FORMAT(v_old, '%Y-%m-%d'),
+               ' → ', DATE_FORMAT(p_new_expiry, '%Y-%m-%d')),
+        p_admin_id,
+        0,
+        NOW()
+    );
+END$$
+
+
+# P8. Auto restock product when below threshold
+CREATE PROCEDURE auto_restock_product(
+    IN p_item_id VARCHAR(7),
+    IN p_threshold INT,
+    IN p_refill INT
+)
+BEGIN
+    DECLARE v_stock INT;
+
+    SELECT Stock_Available INTO v_stock FROM PRODUCT WHERE Item_ID = p_item_id;
+
+    IF v_stock IS NULL THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Unknown Product ID.';
+    END IF;
+
+    IF v_stock < p_threshold THEN
+        UPDATE PRODUCT
+        SET Stock_Available = Stock_Available + p_refill
+        WHERE Item_ID = p_item_id;
+
+        INSERT INTO BUDGET_LOG (Log_ID, Category, Request_ID, Amount, Timestamp)
+        VALUES (
+            CONCAT('BL', LPAD(FLOOR(RAND()*999999),6,'0')),
+            CONCAT('Auto Restocked Product: ', p_item_id),
+            NULL,
+            0,
+            NOW()
+        );
+    END IF;
+END$$
+
+
 						# TRIGGERS
 # T1 - PRODUCT: Normalize category & clamp stock >= 0
 DROP TRIGGER IF EXISTS trg_product_bi$$
@@ -518,11 +634,79 @@ BEGIN
   END IF;
 END$$
 
+# T5 After procurement request approval
+CREATE TRIGGER trg_after_request_approval
+AFTER UPDATE ON PROCUREMENT_REQUEST
+FOR EACH ROW
+BEGIN
+    IF NEW.Status = 'Approved' AND OLD.Status <> 'Approved' THEN
+        INSERT INTO BUDGET_LOG (Log_ID, Category, Dept_ID, Request_ID, Admin_ID, Amount, Timestamp)
+        VALUES (
+            CONCAT('BL', LPAD(FLOOR(RAND()*999999),6,'0')),
+            'Request Approved Automatically Logged',
+            NEW.Dept_ID,
+            NEW.Request_ID,
+            NEW.Approval_Authority,
+            NEW.Total_Cost,
+            NOW()
+        );
+    END IF;
+END$$
+
+
+# T6 After product marked imported
+CREATE TRIGGER trg_after_product_import
+AFTER UPDATE ON PRODUCT
+FOR EACH ROW
+BEGIN
+    IF NEW.Country_of_origin <> 'India' AND OLD.Country_of_origin = 'India' THEN
+        INSERT INTO BUDGET_LOG (Log_ID, Category, Request_ID, Amount, Timestamp)
+        VALUES (
+            CONCAT('BL', LPAD(FLOOR(RAND()*999999),6,'0')),
+            CONCAT('Product Imported: ', NEW.Item_ID),
+            NULL,
+            0,
+            NOW()
+        );
+    END IF;
+END$$
+
+
+# T7 Prevent vendor deletion if products exist
+CREATE TRIGGER trg_before_vendor_delete
+BEFORE DELETE ON VENDOR
+FOR EACH ROW
+BEGIN
+    IF EXISTS (SELECT 1 FROM PRODUCT WHERE Vendor_ID = OLD.Vendor_ID) THEN
+        SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT = 'Cannot delete vendor with active products.';
+    END IF;
+END$$
+
 DELIMITER ;
 
 # TEST Queries
 SELECT calc_total_cost('PRO0001', 3);
+
 CALL create_procurement_request('REQ0007','DPT001','PRO0001','VEN001',5);
 CALL approve_request('REQ0007','ADM001');
 CALL cancel_request('REQ0007','ADM001','Project cancelled');
 CALL blacklist_vendor('VEN002','ADM001','Non-compliance');
+
+SELECT get_department_efficiency('DPT001') AS 'Dept Efficiency %';
+SELECT avg_vendor_contract_duration() AS 'Avg Vendor Contract Days';
+SELECT get_pending_requests_count('DPT001') AS 'Pending Requests';
+
+CALL log_contract_renewal('VEN001', '2030-12-31', 'ADM001');
+CALL auto_restock_product('PROD001', 10, 50);
+
+# Trigger trg_after_request_approval -- (Run this update on an existing request to fire the trigger)
+UPDATE PROCUREMENT_REQUEST
+SET Status = 'Approved',
+    Approval_Authority = 'ADM001'
+WHERE Request_ID = 'REQ001';
+
+# Trigger trg_after_product_import
+UPDATE PRODUCT
+SET Country_of_origin = 'France'
+WHERE Item_ID = 'PROD002';
