@@ -110,14 +110,14 @@ BEGIN
     DECLARE v_current DECIMAL(20,8);
     DECLARE v_eff DECIMAL(5,2);
 
-    SELECT Budget_Allocated, Current_Budget
+    SELECT Budget_Allocation, Current_Budget
     INTO v_alloc, v_current
     FROM DEPARTMENT
     WHERE Dept_ID = p_dept_id;
 
     IF v_alloc IS NULL OR v_alloc = 0 THEN
         SIGNAL SQLSTATE '45000'
-        SET MESSAGE_TEXT = 'Invalid Department or Allocation.';
+        SET MESSAGE_TEXT = 'Invalid Department or No Allocation Found';
     END IF;
 
     SET v_eff = (v_current / v_alloc) * 100;
@@ -144,10 +144,12 @@ CREATE FUNCTION get_pending_requests_count(p_dept_id VARCHAR(6))
 RETURNS INT
 DETERMINISTIC
 BEGIN
-    DECLARE v_count INT;
+    DECLARE v_count INT DEFAULT 0;
+
     SELECT COUNT(*) INTO v_count
     FROM PROCUREMENT_REQUEST
-    WHERE Dept_ID = p_dept_id AND Status = 'Pending';
+    WHERE Dept_ID = p_dept_id
+      AND Status = 'Pending';
     RETURN v_count;
 END$$
 
