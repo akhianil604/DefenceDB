@@ -1,0 +1,121 @@
+{% extends 'base.html' %}
+{% block content %}
+  <div class="content-header">
+    <h3>Analytics</h3>
+  </div>
+
+  <div class="card shadow-sm mb-3"><div class="card-body">
+    <h6 class="card-title">Department KPIs (Aggregates + Join + Nested Spend)</h6>
+    <div class="table-responsive">
+      <table class="table table-sm table-striped align-middle">
+        <thead><tr>
+          <th>Dept_ID</th><th>Name</th><th>Total Requests</th><th>Approved</th><th>Rejected</th><th>Pending</th><th>Total Spend</th><th>Avg Request Cost</th><th>Max Request Cost</th>
+        </tr></thead>
+        <tbody>
+          {% for r in dept_kpis %}
+          <tr>
+            <td>{{ r.Dept_ID }}</td>
+            <td>{{ r.Name }}</td>
+            <td>{{ r.Total_Requests }}</td>
+            <td>{{ r.Approved }}</td>
+            <td>{{ r.Rejected }}</td>
+            <td>{{ r.Pending }}</td>
+            <td>{{ r.Total_Spend }}</td>
+            <td>{{ r.Avg_Request_Cost }}</td>
+            <td>{{ r.Max_Request_Cost }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div></div>
+
+  <div class="row g-3">
+    <div class="col-lg-6">
+      <div class="card shadow-sm h-100"><div class="card-body">
+        <h6 class="card-title">Category Spend (Join + Aggregate)</h6>
+        <div class="table-responsive">
+          <table class="table table-sm table-striped align-middle">
+            <thead><tr><th>Category</th><th>Requests</th><th>Approved Spend</th><th>Avg Unit Cost</th></tr></thead>
+            <tbody>
+              {% for r in cat_spend %}
+              <tr>
+                <td>{{ r.Category }}</td>
+                <td>{{ r.Requests }}</td>
+                <td>{{ r.Approved_Spend }}</td>
+                <td>{{ r.Avg_Unit_Cost }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </div></div>
+    </div>
+    <div class="col-lg-6">
+      <div class="card shadow-sm h-100"><div class="card-body">
+        <h6 class="card-title">Vendor Performance (Subquery + Joins)</h6>
+        <div class="table-responsive">
+          <table class="table table-sm table-striped align-middle">
+            <thead><tr><th>Vendor_ID</th><th>Company</th><th>Product Count</th><th>Total Spend</th></tr></thead>
+            <tbody>
+              {% for r in vendor_perf %}
+              <tr>
+                <td>{{ r.Vendor_ID }}</td>
+                <td>{{ r.Company }}</td>
+                <td>{{ r.Product_Count }}</td>
+                <td>{{ r.Total_Spend }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </div></div>
+    </div>
+  </div>
+
+  <div class="row g-3 mt-1">
+    <div class="col-lg-6">
+      <div class="card shadow-sm h-100"><div class="card-body">
+        <h6 class="card-title">Above-average Spend Departments (Nested Subquery)</h6>
+        <div class="table-responsive">
+          <table class="table table-sm table-striped align-middle">
+            <thead><tr><th>Dept_ID</th><th>Name</th><th>Spend</th></tr></thead>
+            <tbody>
+              {% for r in above_avg_dept %}
+              <tr>
+                <td>{{ r.Dept_ID }}</td>
+                <td>{{ r.Name }}</td>
+                <td>{{ r.Spend }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </div></div>
+    </div>
+    <div class="col-lg-6">
+      <div class="card shadow-sm h-100"><div class="card-body">
+        <h6 class="card-title">High-value Approvals (Joins)</h6>
+        <div class="table-responsive">
+          <table class="table table-sm table-striped align-middle">
+            <thead><tr><th>Request_ID</th><th>Dept_ID</th><th>Item_ID</th><th>Vendor</th><th>Total_Cost</th><th>Approved By</th><th>Date</th></tr></thead>
+            <tbody>
+              {% for r in high_value %}
+              <tr>
+                <td>{{ r.Request_ID }}</td>
+                <td>{{ r.Dept_ID }}</td>
+                <td>{{ r.Item_ID }}</td>
+                <td>{{ r.Vendor }}</td>
+                <td>{{ r.Total_Cost }}</td>
+                <td>{{ r.Approved_By }}</td>
+                <td>{{ r.Date_of_Approval }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </div></div>
+    </div>
+  </div>
+{% endblock %}
+

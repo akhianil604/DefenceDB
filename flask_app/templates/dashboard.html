@@ -1,0 +1,46 @@
+{% extends 'base.html' %}
+{% block content %}
+  <div class="content-header">
+    <h3 class="m-0">Dashboard</h3>
+    <a class="btn btn-sm btn-outline-primary" href="{{ url_for('dashboard') }}">Refresh</a>
+  </div>
+  <div class="row g-3 mb-3">
+    {% for name, value in metrics %}
+    <div class="col-12 col-sm-6 col-lg-4">
+      <div class="card metric-card shadow-sm">
+        <div class="card-body">
+          <div class="d-flex justify-content-between align-items-center">
+            <div>
+              <div class="text-muted small">{{ name }}</div>
+              <div class="fs-4 fw-semibold">{{ value }}</div>
+            </div>
+            <div class="text-secondary">
+              <i class="bi bi-graph-up"></i>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+  <div class="card shadow-sm mb-3">
+    <div class="card-body">
+      <h6 class="card-title">Department Spend Summary (Aggregate + Nested Query)</h6>
+      <div class="table-responsive">
+        <table class="table table-sm table-striped align-middle">
+          <thead><tr><th>Dept_ID</th><th>Name</th><th>Total Spent</th><th>Remaining Budget</th></tr></thead>
+          <tbody>
+            {% for r in spend_rows %}
+              <tr>
+                <td>{{ r.Dept_ID }}</td>
+                <td>{{ r.Name }}</td>
+                <td>{{ r.Spent }}</td>
+                <td>{{ r.Remaining }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+{% endblock %}
