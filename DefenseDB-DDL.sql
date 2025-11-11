@@ -1,3 +1,4 @@
+DROP DATABASE defense_db;
 CREATE DATABASE IF NOT EXISTS defense_db;
 USE defense_db;
 
@@ -8,11 +9,11 @@ CREATE TABLE MINISTRY (
     Admin_ID VARCHAR(6) NOT NULL UNIQUE, # Format: FIN001, DEF001 etc.
     Name VARCHAR(100) NOT NULL, # Full name of ministry official
     Role VARCHAR(50), # Role or designation
-    Email VARCHAR(100) NOT NULL UNIQUE, # Must be unique
+    Email VARCHAR(100) NOT NULL, # Must be unique - UNIQUE 
     Phone VARCHAR(20),
     Timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     Current_Budget DECIMAL(20,8), # Changed precision from (15,2)
-    PRIMARY KEY (Admin_ID, Email)
+    PRIMARY KEY (Admin_ID)
 );
 
 			# 2. DEPARTMENT
@@ -47,7 +48,7 @@ CREATE TABLE VENDOR (
         'Others'
     )),
     Country VARCHAR(50),
-    Email VARCHAR(100) UNIQUE,
+    Email VARCHAR(100), # Removed UNIQUE from here 
     Phone VARCHAR(20),
     Blacklisted BOOLEAN DEFAULT FALSE,
     Contract_Expiry_Date DATE
@@ -79,7 +80,7 @@ CREATE TABLE PRODUCT (
             'Helmets','Defence suits','Uniform',
             'First-aid kits','Medical drones','Surgical instruments',
             'Others'
-        )
+        ) OR Category IS NOT NULL
     )
 );
 
