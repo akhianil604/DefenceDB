@@ -89,7 +89,7 @@ DefenceDB/
 ### Budget Log
 ![Budget Log](images/Budget%20Log.png)
 
-### Joins, Aggregates, Subqueries
+### Joins, Aggregates & Subqueries
 ![Joins, Aggregates, Subqueries](images/Joins%2C%20Aggregates%2C%20Subqueries.png)
 
 ### Joins & Nested Subqueries
